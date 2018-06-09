@@ -1,6 +1,5 @@
 /*
-Package infrastructure is addition to the three vertical layers.
-It supports all of the three layers in different ways, facilitating communication between the layers.
-In simple terms, the infrastructure consists of everything that exists independently of our application: external libraries, database engine, application server, messaging backend and so on.
+Package infrastructure is a layer that holds everything that interacts with other systems - Secondary/Driven Adapters.
+Secondary adapters wrap around a tool and adapt its input/output to a port, which fits the application core needs and can simply be an interface or a complex set of interfaces and objects.
 */
 package infrastructure

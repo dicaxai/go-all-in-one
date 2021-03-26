@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-
 	"github.com/google/uuid"
 
 	"github.com/vardius/go-api-boilerplate/pkg/domain"
@@ -49,7 +48,29 @@ func New(ctx context.Context, tableName string, db *sql.DB) (baseeventstore.Even
 	return &eventStore{tableName: tableName, db: db}, nil
 }
 
-func (s *eventStore) Store(ctx context.Context, events []domain.Event) error {
+func addEventToInsert(values []interface{}, event *domain.Event) ([]interface{}, error) {
+	payload, err := json.Marshal(event.Payload)
+	if err != nil {
+		return nil, apperrors.Wrap(err)
+	}
+	metadata, err := json.Marshal(event.Metadata)
+	if err != nil {
+		return nil, apperrors.Wrap(err)
+	}
+
+	return append(values,
+		event.ID.String(),
+		event.Type,
+		event.StreamID.String(),
+		event.StreamName,
+		event.StreamVersion,
+		event.OccurredAt.UTC(),
+		payload,
+		metadata,
+	), nil
+}
+
+func (s *eventStore) Store(ctx context.Context, events []*domain.Event) error {
 	lenEvents := len(events)
 	if lenEvents == 0 {
 		return nil
@@ -60,32 +81,22 @@ func (s *eventStore) Store(ctx context.Context, events []domain.Event) error {
 
 	if lenEvents > 1 {
 		for i := 0; i < lenEvents-1; i++ {
+			var err error
 			query += "(?, ?, ?, ?, ?, ?, ?, ?),"
-			values = append(values,
-				events[i].ID.String(),
-				events[i].Type,
-				events[i].StreamID.String(),
-				events[i].StreamName,
-				events[i].StreamVersion,
-				events[i].OccurredAt.UTC(),
-				events[i].Payload,
-				events[i].Metadata,
-			)
+			values, err = addEventToInsert(values, events[i])
+			if err != nil {
+				return apperrors.Wrap(err)
+			}
 		}
 	}
 
 	i := lenEvents - 1
-	query += "(?, ?, ?, ?, ?, ?, ?, ?)"
-	values = append(values,
-		events[i].ID.String(),
-		events[i].Type,
-		events[i].StreamID.String(),
-		events[i].StreamName,
-		events[i].StreamVersion,
-		events[i].OccurredAt.UTC(),
-		events[i].Payload,
-		events[i].Metadata,
-	)
+	var err error
+	query += "(?, ?, ?, ?, ?, ?, ?, ?),"
+	values, err = addEventToInsert(values, events[i])
+	if err != nil {
+		return apperrors.Wrap(err)
+	}
 
 	stmt, err := s.db.PrepareContext(ctx, query)
 	if err != nil {
@@ -100,15 +111,15 @@ func (s *eventStore) Store(ctx context.Context, events []domain.Event) error {
 	return nil
 }
 
-func (s *eventStore) Get(ctx context.Context, id uuid.UUID) (domain.Event, error) {
+func (s *eventStore) Get(ctx context.Context, id uuid.UUID) (*domain.Event, error) {
 	query := "SELECT event_id, event_type, stream_id, stream_name, stream_version, occurred_at, payload, metadata FROM " + s.tableName + " WHERE event_id=? LIMIT 1"
 	row := s.db.QueryRowContext(ctx, query, id.String())
 
-	var event domain.Event
-
 	var (
+		event    domain.Event
 		eventId  string
 		streamID string
+		payload  json.RawMessage
 		metadata sql.NullString
 	)
 	err := row.Scan(
@@ -118,29 +129,37 @@ func (s *eventStore) Get(ctx context.Context, id uuid.UUID) (domain.Event, error
 		&event.StreamName,
 		&event.StreamVersion,
 		&event.OccurredAt,
-		&event.Payload,
+		payload,
 		&metadata,
 	)
 
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		return event, apperrors.Wrap(fmt.Errorf("%w: %s", baseeventstore.ErrEventNotFound, err))
+		return nil, apperrors.Wrap(fmt.Errorf("%w: %s", baseeventstore.ErrEventNotFound, err))
 	case err != nil:
-		return event, apperrors.Wrap(fmt.Errorf("%w: %s (%s)", err, query, id.String()))
+		return nil, apperrors.Wrap(fmt.Errorf("%w: %s (%s)", err, query, id.String()))
+	}
+
+	event.Payload, err = getRawEvent(event.Type, payload)
+	if err != nil {
+		return nil, apperrors.Wrap(err)
+	}
+	event.Metadata, err = getEventMetadata(json.RawMessage(metadata.String))
+	if err != nil {
+		return nil, apperrors.Wrap(err)
 	}
 
 	event.ID = uuid.MustParse(eventId)
 	event.StreamID = uuid.MustParse(streamID)
-	event.Metadata = json.RawMessage(metadata.String)
 
-	return event, nil
+	return &event, nil
 }
 
-func (s *eventStore) FindAll(ctx context.Context) ([]domain.Event, error) {
+func (s *eventStore) FindAll(ctx context.Context) ([]*domain.Event, error) {
 	return nil, apperrors.Wrap(fmt.Errorf("should never load all events from mysql"))
 }
 
-func (s *eventStore) GetStream(ctx context.Context, streamID uuid.UUID, streamName string) ([]domain.Event, error) {
+func (s *eventStore) GetStream(ctx context.Context, streamID uuid.UUID, streamName string) ([]*domain.Event, error) {
 	query := "SELECT event_id, event_type, stream_name, stream_version, occurred_at, payload, metadata FROM " + s.tableName + " WHERE stream_id=? AND stream_name=? ORDER BY distinct_id ASC"
 	rows, err := s.db.QueryContext(ctx, query, streamID.String(), streamName)
 	if err != nil {
@@ -148,12 +167,13 @@ func (s *eventStore) GetStream(ctx context.Context, streamID uuid.UUID, streamNa
 	}
 	defer rows.Close()
 
-	var events []domain.Event
+	var events []*domain.Event
 
 	for rows.Next() {
 		var (
 			event    domain.Event
 			id       string
+			payload  json.RawMessage
 			metadata sql.NullString
 		)
 		if err := rows.Scan(
@@ -162,17 +182,25 @@ func (s *eventStore) GetStream(ctx context.Context, streamID uuid.UUID, streamNa
 			&event.StreamName,
 			&event.StreamVersion,
 			&event.OccurredAt,
-			&event.Payload,
+			payload,
 			&metadata,
 		); err != nil {
 			return nil, apperrors.Wrap(err)
 		}
 
+		event.Payload, err = getRawEvent(event.Type, payload)
+		if err != nil {
+			return nil, apperrors.Wrap(err)
+		}
+		event.Metadata, err = getEventMetadata(json.RawMessage(metadata.String))
+		if err != nil {
+			return nil, apperrors.Wrap(err)
+		}
+
 		event.ID = uuid.MustParse(id)
 		event.StreamID = streamID
-		event.Metadata = json.RawMessage(metadata.String)
 
-		events = append(events, event)
+		events = append(events, &event)
 	}
 
 	if err := rows.Err(); err != nil {
@@ -182,7 +210,7 @@ func (s *eventStore) GetStream(ctx context.Context, streamID uuid.UUID, streamNa
 	return events, nil
 }
 
-func (s *eventStore) GetStreamEventsByType(ctx context.Context, streamID uuid.UUID, streamName, eventType string) ([]domain.Event, error) {
+func (s *eventStore) GetStreamEventsByType(ctx context.Context, streamID uuid.UUID, streamName, eventType string) ([]*domain.Event, error) {
 	query := "SELECT event_id, stream_name, stream_version, occurred_at, payload, metadata FROM " + s.tableName + " WHERE stream_id=? AND stream_name=? AND event_type=? ORDER BY distinct_id ASC"
 	rows, err := s.db.QueryContext(ctx, query, streamID.String(), streamName, eventType)
 	if err != nil {
@@ -190,12 +218,13 @@ func (s *eventStore) GetStreamEventsByType(ctx context.Context, streamID uuid.UU
 	}
 	defer rows.Close()
 
-	var events []domain.Event
+	var events []*domain.Event
 
 	for rows.Next() {
 		var (
 			event    domain.Event
 			id       string
+			payload  json.RawMessage
 			metadata sql.NullString
 		)
 		if err := rows.Scan(
@@ -203,18 +232,26 @@ func (s *eventStore) GetStreamEventsByType(ctx context.Context, streamID uuid.UU
 			&event.StreamName,
 			&event.StreamVersion,
 			&event.OccurredAt,
-			&event.Payload,
+			payload,
 			&metadata,
 		); err != nil {
+			return nil, apperrors.Wrap(err)
+		}
+
+		event.Payload, err = getRawEvent(event.Type, payload)
+		if err != nil {
+			return nil, apperrors.Wrap(err)
+		}
+		event.Metadata, err = getEventMetadata(json.RawMessage(metadata.String))
+		if err != nil {
 			return nil, apperrors.Wrap(err)
 		}
 
 		event.ID = uuid.MustParse(id)
 		event.StreamID = streamID
 		event.Type = eventType
-		event.Metadata = json.RawMessage(metadata.String)
 
-		events = append(events, event)
+		events = append(events, &event)
 	}
 
 	if err := rows.Err(); err != nil {
@@ -222,4 +259,27 @@ func (s *eventStore) GetStreamEventsByType(ctx context.Context, streamID uuid.UU
 	}
 
 	return events, nil
+}
+
+func getRawEvent(eventType string, data json.RawMessage) (domain.RawEvent, error) {
+	rawEvent, err := domain.NewRawEvent(eventType)
+	if err != nil {
+		return nil, apperrors.Wrap(fmt.Errorf("failed to create raw event:%s: %w", eventType, err))
+	}
+	if err := json.Unmarshal(data, &rawEvent); err != nil {
+		return nil, apperrors.Wrap(fmt.Errorf("failed to unmarshal raw event:%s: %w", eventType, err))
+	}
+
+	return rawEvent, nil
+}
+
+func getEventMetadata(data json.RawMessage) (*domain.EventMetadata, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+	var meta domain.EventMetadata
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, apperrors.Wrap(fmt.Errorf("failed to unmarshal event meta: %w", err))
+	}
+	return &meta, nil
 }
